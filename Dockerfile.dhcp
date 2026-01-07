@@ -1,0 +1,108 @@
+# Multi-stage Dockerfile for ISC Kea DHCP Server
+# Builds DHCP4, DHCP6, and Control Agent from source
+# Uses the local Kea fork at ../kea
+
+# ============================================================================
+# Stage 1: Build Dependencies
+# ============================================================================
+FROM ubuntu:22.04 AS builder
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+# Note: PostgreSQL support is included for production/HA deployments
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    ninja-build \
+    pkg-config \
+    libboost-dev \
+    libboost-system-dev \
+    liblog4cplus-dev \
+    libssl-dev \
+    libbotan-2-dev \
+    libpq-dev \
+    postgresql-client \
+    flex \
+    bison \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create build virtual environment for all build tools and dependencies
+# This isolates all Python packages and build tools from system packages
+RUN python3 -m venv /opt/build-venv && \
+    /opt/build-venv/bin/pip install --upgrade pip setuptools wheel && \
+    /opt/build-venv/bin/pip install meson>=1.1.0
+
+# Ensure build venv is in PATH for all subsequent commands
+ENV PATH="/opt/build-venv/bin:${PATH}"
+
+# Set working directory
+WORKDIR /build
+
+# Copy Kea source code (this Dockerfile is in the Kea repo)
+COPY . /build/kea
+
+# Build Kea
+# Enable PostgreSQL support for production/HA deployments
+# MySQL remains disabled (can be enabled if needed)
+WORKDIR /build/kea
+RUN meson setup build \
+    -Dprefix=/usr \
+    -Dcrypto=openssl \
+    -Dmysql=disabled \
+    -Dpostgresql=enabled
+
+# Compile Kea (builds all binaries including kea-dhcp4, kea-dhcp6, kea-ctrl-agent)
+RUN meson compile -C build
+
+# Install to staging directory
+RUN meson install -C build --destdir /build/stage
+
+# ============================================================================
+# Stage 2: Runtime Image
+# ============================================================================
+FROM ubuntu:22.04
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies
+# Note: We use OpenSSL (not Botan) for crypto, so libbotan is not needed at runtime
+# PostgreSQL client libraries included for database backend support
+RUN apt-get update && apt-get install -y \
+    libboost-system1.74.0 \
+    liblog4cplus-2.0.5 \
+    libssl3 \
+    libpq5 \
+    ca-certificates \
+    curl \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed binaries and libraries from builder
+COPY --from=builder /build/stage/usr/sbin/kea-dhcp4 /usr/sbin/kea-dhcp4
+COPY --from=builder /build/stage/usr/sbin/kea-dhcp6 /usr/sbin/kea-dhcp6
+COPY --from=builder /build/stage/usr/sbin/kea-ctrl-agent /usr/sbin/kea-ctrl-agent
+COPY --from=builder /build/stage/usr/lib/ /usr/lib/
+COPY --from=builder /build/stage/usr/share/kea/ /usr/share/kea/
+
+# Create necessary directories
+RUN mkdir -p /etc/kea /var/lib/kea /var/log/kea /var/run/kea
+
+# Expose ports
+# - 67/udp: DHCP4 server
+# - 547/udp: DHCP6 server  
+# - 8000/tcp: Control Agent REST API
+EXPOSE 67/udp 547/udp 8000/tcp
+
+# Default Kea configuration directory
+WORKDIR /etc/kea
+
+# Default command runs Control Agent (which can manage both DHCP4 and DHCP6)
+# Individual services can be started separately if needed
+CMD ["kea-ctrl-agent", "-c", "/etc/kea/kea-dhcp4.conf"]
